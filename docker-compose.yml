@@ -1,0 +1,26 @@
+# Postgres with the EV quartet deck, for the n8n agent.
+# Runs next to your existing n8n container (that one is not touched).
+#
+#   docker compose up -d
+#
+# n8n (in Docker) reaches it at host.docker.internal:55432.
+# The init script in ./db runs only on the FIRST start (empty volume).
+# To reload the cards from scratch:  docker compose down -v && docker compose up -d
+
+services:
+  quartet-db:
+    image: postgres:16
+    container_name: quartet-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: quartet
+      POSTGRES_PASSWORD: quartet
+      POSTGRES_DB: quartet
+    ports:
+      - "55432:5432"   # 55432 on your PC, so it can't clash with another Postgres on 5432
+    volumes:
+      - ./db:/docker-entrypoint-initdb.d:ro
+      - quartet-data:/var/lib/postgresql/data
+
+volumes:
+  quartet-data:

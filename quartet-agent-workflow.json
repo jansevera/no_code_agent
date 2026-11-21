@@ -1,0 +1,280 @@
+{
+  "name": "EV Quartet Referee Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "public": false,
+        "options": {}
+      },
+      "type": "@n8n/n8n-nodes-langchain.chatTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        0,
+        0
+      ],
+      "id": "97737a16-03c4-4cd5-b6fd-e18ff7e4b3c9",
+      "name": "When chat message received",
+      "webhookId": "39569fdd-8e79-4b66-bd71-836c94844539"
+    },
+    {
+      "parameters": {
+        "options": {
+          "systemMessage": "You are the referee and expert of an electric car quartet card game (Quartett).\nThe deck has 32 cards in 8 sets (A-H) of 4 cards. All card data is in a PostgreSQL database.\nNever guess card values: always get them with the tools.\n\nDatabase table `cards` (one row per card):\n- card_id (e.g. 'A1'), set_letter ('A'..'H'), set_theme (e.g. 'Sedans', 'Supercars')\n- car_name (e.g. 'Škoda Enyaq'), car_name_ascii (same without accents, e.g. 'Skoda Enyaq'), car_version\n- range_km (higher wins), acc_0_100_s (0-100 km/h in seconds, LOWER wins),\n  top_speed_kmh (higher wins), battery_kwh (higher wins),\n  consumption_kwh_100km (kWh/100 km = battery / range * 100, LOWER wins)\n\nTools:\n- query_cards_db: run ONE read-only PostgreSQL SELECT. Find cars by name with\n  car_name_ascii ILIKE '%ioniq 6%' (people often type names without accents or only part of the name).\n- compare_cards: decide who wins a round. Give it both cards' ids, the stat column name\n  and both values you got from the database. It applies the rules (lower wins for acceleration and consumption).\n- calculate_consumption: kWh per 100 km from a battery size and a range (also for cars that are not in the deck).\n- best_in_set: ranking of the 4 cards of one set (A-H) on one stat, best first.\n- best_in_deck: ranking of all 32 cards on one stat. position 1 = best, 2 = second best,\n  -1 = worst, -2 = second worst, 0 = the whole ranking.\n\nAnswer briefly, in the language the user writes in, and always name the winner with the values and units.",
+          "maxIterations": 10
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.agent",
+      "typeVersion": 2.2,
+      "position": [
+        260,
+        0
+      ],
+      "id": "4e89542e-592d-43f9-b4a5-5e3a691f99da",
+      "name": "Quartet referee agent"
+    },
+    {
+      "parameters": {
+        "model": {
+          "__rl": true,
+          "mode": "id",
+          "value": "unsloth/gemma-4-E4B-it-GGUF:UD-Q4_K_XL"
+        },
+        "options": {
+          "temperature": 0.2
+        }
+      },
+      "type": "@n8n/n8n-nodes-langchain.lmChatOpenAi",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        260
+      ],
+      "id": "c62c20d1-eaba-491c-9a1d-33429529027d",
+      "name": "Unsloth Studio (OpenAI-compatible)",
+      "credentials": {
+        "openAiApi": {
+          "id": "unslothStudio",
+          "name": "Unsloth Studio"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "contextWindowLength": 10
+      },
+      "type": "@n8n/n8n-nodes-langchain.memoryBufferWindow",
+      "typeVersion": 1.3,
+      "position": [
+        180,
+        260
+      ],
+      "id": "c45adab5-7266-4e3c-a15d-31fb028766b9",
+      "name": "Simple Memory"
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Run one read-only PostgreSQL SELECT query on the EV quartet card database and get the rows back. Tables: cards(card_id, set_letter, set_theme, car_name, car_name_ascii, car_version, range_km, acc_0_100_s, top_speed_kmh, battery_kwh, consumption_kwh_100km).",
+        "operation": "executeQuery",
+        "query": "={{ $fromAI('sql_query', 'One PostgreSQL SELECT statement, e.g. SELECT * FROM cards WHERE car_name_ascii ILIKE \\'%model 3%\\'', 'string') }}",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.6,
+      "position": [
+        360,
+        260
+      ],
+      "id": "bd91dd35-647c-4296-9929-0d47d6974f4d",
+      "name": "query_cards_db",
+      "credentials": {
+        "postgres": {
+          "id": "quartetReadOnly",
+          "name": "Quartet DB (read-only)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "description": "Decide who wins a quartet round between two cards on one stat. Applies the rules: higher wins, except acc_0_100_s and consumption_kwh_100km where lower wins. Returns JSON with the winner (card_id or 'tie') and the difference.",
+        "language": "javaScript",
+        "jsCode": "// The agent sends: card_a, value_a, card_b, value_b, stat\n// Quartet rule: the higher value wins, except acceleration and consumption (lower wins).\nconst LOWER_WINS = ['acc_0_100_s', 'consumption_kwh_100km'];\nconst UNITS = {\n  range_km: 'km', acc_0_100_s: 's', top_speed_kmh: 'km/h',\n  battery_kwh: 'kWh', consumption_kwh_100km: 'kWh/100 km',\n};\n\nconst stat = String(query.stat).trim();\nif (!(stat in UNITS)) {\n  return `Unknown stat \"${stat}\". Use one of: ${Object.keys(UNITS).join(', ')}.`;\n}\nconst a = Number(query.value_a);\nconst b = Number(query.value_b);\nif (Number.isNaN(a) || Number.isNaN(b)) {\n  return 'value_a and value_b must be numbers from the database.';\n}\n\nconst lowerWins = LOWER_WINS.includes(stat);\nlet winner = 'tie';\nif (a !== b) {\n  const aWins = lowerWins ? a < b : a > b;\n  winner = aWins ? query.card_a : query.card_b;\n}\n\nreturn JSON.stringify({\n  stat,\n  unit: UNITS[stat],\n  rule: lowerWins ? 'lower wins' : 'higher wins',\n  [query.card_a]: a,\n  [query.card_b]: b,\n  winner,\n  difference: Math.round(Math.abs(a - b) * 100) / 100,\n});",
+        "specifyInputSchema": true,
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"card_a\": {\n      \"type\": \"string\",\n      \"description\": \"card_id of the first card, e.g. A1\"\n    },\n    \"value_a\": {\n      \"type\": \"number\",\n      \"description\": \"value of the stat on the first card\"\n    },\n    \"card_b\": {\n      \"type\": \"string\",\n      \"description\": \"card_id of the second card, e.g. B3\"\n    },\n    \"value_b\": {\n      \"type\": \"number\",\n      \"description\": \"value of the stat on the second card\"\n    },\n    \"stat\": {\n      \"type\": \"string\",\n      \"enum\": [\n        \"range_km\",\n        \"acc_0_100_s\",\n        \"top_speed_kmh\",\n        \"battery_kwh\",\n        \"consumption_kwh_100km\"\n      ],\n      \"description\": \"column name of the stat that is played\"\n    }\n  },\n  \"required\": [\n    \"card_a\",\n    \"value_a\",\n    \"card_b\",\n    \"value_b\",\n    \"stat\"\n  ]\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.3,
+      "position": [
+        540,
+        260
+      ],
+      "id": "5bb5c59e-d6bb-4a85-bcfd-4dedb46f4b7c",
+      "name": "compare_cards"
+    },
+    {
+      "parameters": {
+        "description": "Calculate energy consumption in kWh per 100 km from battery capacity (kWh) and range (km): battery / range * 100.",
+        "language": "javaScript",
+        "jsCode": "// The agent sends: battery_kwh, range_km\n// Consumption = battery / range * 100  (kWh per 100 km)\nconst battery = Number(query.battery_kwh);\nconst range = Number(query.range_km);\nif (!(battery > 0) || !(range > 0)) {\n  return 'battery_kwh and range_km must be numbers greater than 0.';\n}\nconst perHundred = Math.round((battery / range) * 100 * 100) / 100;\nreturn JSON.stringify({\n  battery_kwh: battery,\n  range_km: range,\n  kwh_per_100km: perHundred,\n});",
+        "specifyInputSchema": true,
+        "schemaType": "manual",
+        "inputSchema": "{\n  \"type\": \"object\",\n  \"properties\": {\n    \"battery_kwh\": {\n      \"type\": \"number\",\n      \"description\": \"usable battery capacity in kWh\"\n    },\n    \"range_km\": {\n      \"type\": \"number\",\n      \"description\": \"range in km\"\n    }\n  },\n  \"required\": [\n    \"battery_kwh\",\n    \"range_km\"\n  ]\n}"
+      },
+      "type": "@n8n/n8n-nodes-langchain.toolCode",
+      "typeVersion": 1.3,
+      "position": [
+        720,
+        260
+      ],
+      "id": "062e340e-df8d-481a-becd-b550125a19ff",
+      "name": "calculate_consumption"
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Rank the 4 cards of one set (A-H) on one stat, best first. Applies the rules (lower wins for acc_0_100_s and consumption_kwh_100km). Use it for questions like 'which car in set G is fastest'.",
+        "operation": "executeQuery",
+        "query": "SELECT rank() OVER (ORDER BY CASE WHEN $2::text IN ('acc_0_100_s', 'consumption_kwh_100km') THEN value ELSE -value END) AS place,\n       card_id, car_name, set_theme, $2::text AS stat, value,\n       CASE WHEN $2::text IN ('acc_0_100_s', 'consumption_kwh_100km') THEN 'lower wins' ELSE 'higher wins' END AS rule\nFROM (\n  SELECT card_id, car_name, set_theme,\n         CASE $2::text\n           WHEN 'range_km'              THEN range_km::numeric\n           WHEN 'acc_0_100_s'           THEN acc_0_100_s\n           WHEN 'top_speed_kmh'         THEN top_speed_kmh::numeric\n           WHEN 'battery_kwh'           THEN battery_kwh\n           WHEN 'consumption_kwh_100km' THEN consumption_kwh_100km\n         END AS value\n  FROM cards\n  WHERE set_letter = upper(left(trim($1::text), 1))\n) AS s\nWHERE value IS NOT NULL\nORDER BY place;",
+        "options": {
+          "queryReplacement": "={{ $fromAI('set_letter', 'set letter A-H', 'string') }},{{ $fromAI('stat', 'stat column: range_km, acc_0_100_s, top_speed_kmh, battery_kwh or consumption_kwh_100km', 'string') }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.6,
+      "position": [
+        900,
+        260
+      ],
+      "id": "38434e5b-f28a-4f79-9bfb-087a5a21d697",
+      "name": "best_in_set",
+      "credentials": {
+        "postgres": {
+          "id": "quartetReadOnly",
+          "name": "Quartet DB (read-only)"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "descriptionType": "manual",
+        "toolDescription": "Rank all 32 cards of the deck on one stat, best first (lower wins for acc_0_100_s and consumption_kwh_100km). position 1 = best card, 2 = second best, -1 = worst, -2 = second worst, 0 = whole ranking. Cards with the same value share a place.",
+        "operation": "executeQuery",
+        "query": "WITH s AS (\n  SELECT card_id, car_name, set_letter, set_theme,\n         CASE $1::text\n           WHEN 'range_km'              THEN range_km::numeric\n           WHEN 'acc_0_100_s'           THEN acc_0_100_s\n           WHEN 'top_speed_kmh'         THEN top_speed_kmh::numeric\n           WHEN 'battery_kwh'           THEN battery_kwh\n           WHEN 'consumption_kwh_100km' THEN consumption_kwh_100km\n         END AS value\n  FROM cards\n), r AS (\n  SELECT *,\n         rank()       OVER (ORDER BY CASE WHEN $1::text IN ('acc_0_100_s', 'consumption_kwh_100km') THEN value ELSE -value END) AS place,\n         row_number() OVER (ORDER BY CASE WHEN $1::text IN ('acc_0_100_s', 'consumption_kwh_100km') THEN value ELSE -value END, card_id) AS rn,\n         count(*)     OVER () AS cards_in_deck\n  FROM s\n  WHERE value IS NOT NULL\n)\nSELECT place, card_id, car_name, set_letter, set_theme, $1::text AS stat, value,\n       CASE WHEN $1::text IN ('acc_0_100_s', 'consumption_kwh_100km') THEN 'lower wins' ELSE 'higher wins' END AS rule,\n       cards_in_deck\nFROM r\nWHERE $2::int = 0\n   OR rn = CASE WHEN $2::int > 0 THEN $2::int ELSE cards_in_deck + 1 + $2::int END\nORDER BY rn;",
+        "options": {
+          "queryReplacement": "={{ $fromAI('stat', 'stat column: range_km, acc_0_100_s, top_speed_kmh, battery_kwh or consumption_kwh_100km', 'string') }},{{ $fromAI('position', '1 = best, 2 = second best, -1 = worst, 0 = whole ranking', 'number') }}"
+        }
+      },
+      "type": "n8n-nodes-base.postgresTool",
+      "typeVersion": 2.6,
+      "position": [
+        1080,
+        260
+      ],
+      "id": "f8a6bbef-5d49-43fd-9ed8-a1ed40f42018",
+      "name": "best_in_deck",
+      "credentials": {
+        "postgres": {
+          "id": "quartetReadOnly",
+          "name": "Quartet DB (read-only)"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "When chat message received": {
+      "main": [
+        [
+          {
+            "node": "Quartet referee agent",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Unsloth Studio (OpenAI-compatible)": {
+      "ai_languageModel": [
+        [
+          {
+            "node": "Quartet referee agent",
+            "type": "ai_languageModel",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simple Memory": {
+      "ai_memory": [
+        [
+          {
+            "node": "Quartet referee agent",
+            "type": "ai_memory",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "query_cards_db": {
+      "ai_tool": [
+        [
+          {
+            "node": "Quartet referee agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "compare_cards": {
+      "ai_tool": [
+        [
+          {
+            "node": "Quartet referee agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "calculate_consumption": {
+      "ai_tool": [
+        [
+          {
+            "node": "Quartet referee agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "best_in_deck": {
+      "ai_tool": [
+        [
+          {
+            "node": "Quartet referee agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "best_in_set": {
+      "ai_tool": [
+        [
+          {
+            "node": "Quartet referee agent",
+            "type": "ai_tool",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "pinData": {},
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "active": false,
+  "tags": []
+}
